@@ -1,8 +1,10 @@
 import argparse
+import csv
 import math
 import os
 import random
 import tempfile
+import time
 from pathlib import Path
 
 from PIL import Image
@@ -142,11 +144,96 @@ def reduce_mean(t: torch.Tensor) -> torch.Tensor:
     return rt
 
 
+def reduce_sum(t: torch.Tensor) -> torch.Tensor:
+    if not dist.is_available() or not dist.is_initialized():
+        return t
+    rt = t.detach().clone()
+    dist.all_reduce(rt, op=dist.ReduceOp.SUM)
+    return rt
+
+
+def _gaussian_kernel_1d(window_size: int, sigma: float, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    coords = torch.arange(window_size, device=device, dtype=dtype) - (window_size - 1) / 2.0
+    g = torch.exp(-(coords**2) / (2 * (sigma**2)))
+    g = g / torch.sum(g)
+    return g
+
+
+def _create_gaussian_window(window_size: int, sigma: float, channels: int, device: torch.device, dtype: torch.dtype) -> torch.Tensor:
+    g1d = _gaussian_kernel_1d(window_size, sigma, device=device, dtype=dtype)
+    g2d = (g1d[:, None] @ g1d[None, :]).unsqueeze(0).unsqueeze(0)
+    window = g2d.expand(channels, 1, window_size, window_size).contiguous()
+    return window
+
+
+def ssim_torch(
+    x: torch.Tensor,
+    y: torch.Tensor,
+    window_size: int = 11,
+    sigma: float = 1.5,
+    data_range: float = 1.0,
+    k1: float = 0.01,
+    k2: float = 0.03,
+    eps: float = 1e-12,
+) -> torch.Tensor:
+    """Compute SSIM for tensors in range [0, data_range].
+
+    Args:
+        x, y: (N, C, H, W)
+    Returns:
+        ssim: (N,) SSIM per-image.
+    """
+    if x.shape != y.shape:
+        raise ValueError(f"SSIM inputs must have same shape, got {x.shape} vs {y.shape}")
+    if x.dim() != 4:
+        raise ValueError(f"SSIM expects NCHW tensors, got dim={x.dim()}")
+
+    n, c, h, w = x.shape
+    window_size = int(window_size)
+    window_size = min(window_size, h, w)
+    if window_size % 2 == 0:
+        window_size = max(1, window_size - 1)
+    if window_size < 1:
+        window_size = 1
+
+    window = _create_gaussian_window(window_size, sigma, c, device=x.device, dtype=x.dtype)
+    padding = window_size // 2
+
+    mu_x = F.conv2d(x, window, padding=padding, groups=c)
+    mu_y = F.conv2d(y, window, padding=padding, groups=c)
+
+    mu_x2 = mu_x * mu_x
+    mu_y2 = mu_y * mu_y
+    mu_xy = mu_x * mu_y
+
+    sigma_x2 = F.conv2d(x * x, window, padding=padding, groups=c) - mu_x2
+    sigma_y2 = F.conv2d(y * y, window, padding=padding, groups=c) - mu_y2
+    sigma_xy = F.conv2d(x * y, window, padding=padding, groups=c) - mu_xy
+
+    c1 = (k1 * data_range) ** 2
+    c2 = (k2 * data_range) ** 2
+
+    num = (2.0 * mu_xy + c1) * (2.0 * sigma_xy + c2)
+    den = (mu_x2 + mu_y2 + c1) * (sigma_x2 + sigma_y2 + c2)
+    ssim_map = num / (den + eps)
+
+    return ssim_map.mean(dim=(1, 2, 3))
+
+
+def _format_seconds_hhmmss(seconds: float) -> str:
+    seconds = int(max(0, round(float(seconds))))
+    h = seconds // 3600
+    m = (seconds % 3600) // 60
+    s = seconds % 60
+    return f"{h:02d}-{m:02d}-{s:02d}"
+
+
 @torch.no_grad()
 def evaluate(model, loader, device, task: str = "auto", amp: bool = True):
     model.eval()
 
     total_psnr = torch.tensor(0.0, device=device)
+    total_ssim = torch.tensor(0.0, device=device)
     total_count = torch.tensor(0.0, device=device)
 
     pbar = loader
@@ -163,15 +250,20 @@ def evaluate(model, loader, device, task: str = "auto", amp: bool = True):
         out = torch.clamp(out, 0.0, 1.0)
         mse = F.mse_loss(out, gt, reduction="none").mean(dim=(1, 2, 3))
         psnr = 10.0 * torch.log10(1.0 / torch.clamp(mse, min=1e-10))
+        ssim = ssim_torch(out, gt)
 
         total_psnr += psnr.sum()
+        total_ssim += ssim.sum()
         total_count += torch.tensor(float(psnr.numel()), device=device)
 
-    total_psnr = reduce_mean(total_psnr)
-    total_count = reduce_mean(total_count)
+    total_psnr = reduce_sum(total_psnr)
+    total_ssim = reduce_sum(total_ssim)
+    total_count = reduce_sum(total_count)
 
     model.train()
-    return (total_psnr / torch.clamp(total_count, min=1.0)).item()
+    avg_psnr = (total_psnr / torch.clamp(total_count, min=1.0)).item()
+    avg_ssim = (total_ssim / torch.clamp(total_count, min=1.0)).item()
+    return avg_psnr, avg_ssim
 
 
 def load_checkpoint_params(path: str, device: torch.device):
@@ -249,6 +341,7 @@ def main():
 
     start_epoch = 0
     best_psnr = -1.0
+    best_ssim = -1.0
 
     if args.resume:
         resume_ckpt = torch.load(args.resume, map_location={"cuda:0": str(device)} if device.type == "cuda" else "cpu", weights_only=False)
@@ -261,6 +354,7 @@ def main():
             opt_state = None
         start_epoch = int(resume_ckpt.get("epoch", 0))
         best_psnr = float(resume_ckpt.get("best_psnr", best_psnr))
+        best_ssim = float(resume_ckpt.get("best_ssim", best_ssim))
         if is_main_process():
             print(f"Resumed from: {args.resume} (epoch={start_epoch})")
     else:
@@ -333,18 +427,51 @@ def main():
     amp = bool(train_opt.get("amp", True))
     scaler = torch.cuda.amp.GradScaler(enabled=amp and device.type == "cuda")
 
-    exp_root = Path(opt.get("experiment_root", "./experiments")) / opt.get("experiment_name", "finetune")
+    base_exp_root = Path(opt.get("experiment_root", "./experiments")) / opt.get("experiment_name", "finetune")
+
+    if args.resume:
+        resume_path = Path(args.resume).resolve()
+        if resume_path.parent.name == "models":
+            exp_root = resume_path.parent.parent
+        else:
+            exp_root = resume_path.parent
+        run_name = exp_root.name
+    else:
+        run_name = time.strftime("%Y%m%d_%H%M%S", time.localtime())
+        if dist.is_available() and dist.is_initialized():
+            obj_list = [run_name if is_main_process() else None]
+            dist.broadcast_object_list(obj_list, src=0)
+            run_name = obj_list[0]
+        exp_root = base_exp_root / run_name
+
+    if is_main_process():
+        exp_root.mkdir(parents=True, exist_ok=True)
+    if dist.is_available() and dist.is_initialized():
+        dist.barrier()
+
     models_dir = exp_root / "models"
     models_dir.mkdir(parents=True, exist_ok=True)
 
+    metrics_csv_path = exp_root / "result.csv"
+    if is_main_process() and (not metrics_csv_path.is_file()):
+        with open(metrics_csv_path, "w", newline="") as f:
+            w = csv.writer(f)
+            w.writerow(["epoch", "train_psnr", "train_ssim", "val_psnr", "val_ssim"])
+
     task = str(train_opt.get("task", "auto"))
-    save_every = int(train_opt.get("save_every", 1))
     val_every = int(train_opt.get("val_every", 1))
 
+    train_start_time = time.time()
+
     for epoch in range(start_epoch, total_epochs):
+        epoch_start_time = time.time()
         train_sampler.set_epoch(epoch)
 
         model.train()
+
+        train_psnr_sum = torch.tensor(0.0, device=device)
+        train_ssim_sum = torch.tensor(0.0, device=device)
+        train_count = torch.tensor(0.0, device=device)
 
         pbar = train_loader
         if is_main_process():
@@ -361,6 +488,14 @@ def main():
                 out = torch.clamp(out, 0.0, 1.0)
                 loss = F.l1_loss(out, gt)
 
+            with torch.no_grad():
+                mse = F.mse_loss(out, gt, reduction="none").mean(dim=(1, 2, 3))
+                psnr = 10.0 * torch.log10(1.0 / torch.clamp(mse, min=1e-10))
+                ssim = ssim_torch(out, gt)
+                train_psnr_sum += psnr.sum()
+                train_ssim_sum += ssim.sum()
+                train_count += torch.tensor(float(psnr.numel()), device=device)
+
             loss_mean = reduce_mean(loss)
 
             scaler.scale(loss).backward()
@@ -372,40 +507,70 @@ def main():
 
         scheduler.step()
 
+        train_psnr_sum = reduce_sum(train_psnr_sum)
+        train_ssim_sum = reduce_sum(train_ssim_sum)
+        train_count = reduce_sum(train_count)
+        train_psnr = (train_psnr_sum / torch.clamp(train_count, min=1.0)).item()
+        train_ssim = (train_ssim_sum / torch.clamp(train_count, min=1.0)).item()
+
         if (epoch + 1) % val_every == 0:
-            psnr = evaluate(model, val_loader, device=device, task=task, amp=amp)
+            val_psnr, val_ssim = evaluate(model, val_loader, device=device, task=task, amp=amp)
             if is_main_process():
-                print(f"Epoch {epoch+1}: val_psnr={psnr:.3f}")
-            if psnr > best_psnr:
-                best_psnr = psnr
+                print(
+                    f"Epoch {epoch+1}: train_psnr={train_psnr:.3f} train_ssim={train_ssim:.4f} "
+                    f"val_psnr={val_psnr:.3f} val_ssim={val_ssim:.4f}"
+                )
+
+                with open(metrics_csv_path, "a", newline="") as f:
+                    w = csv.writer(f)
+                    w.writerow([epoch + 1, f"{train_psnr:.6f}", f"{train_ssim:.6f}", f"{val_psnr:.6f}", f"{val_ssim:.6f}"])
+
+            if val_psnr > best_psnr:
+                best_psnr = val_psnr
+                best_ssim = val_ssim
                 if is_main_process():
+                    elapsed = _format_seconds_hhmmss(time.time() - train_start_time)
+                    epoch_elapsed = _format_seconds_hhmmss(time.time() - epoch_start_time)
+                    best_name = (
+                        f"best_e{epoch+1:04d}_t{elapsed}_ep{epoch_elapsed}_"
+                        f"psnr{val_psnr:.3f}_ssim{val_ssim:.4f}.pt"
+                    )
                     torch.save(
                         {
                             "params": model.state_dict(),
                             "epoch": epoch + 1,
                             "best_psnr": best_psnr,
+                            "best_ssim": best_ssim,
                         },
                         models_dir / "best.pt",
                     )
 
-        if is_main_process() and ((epoch + 1) % save_every == 0 or (epoch + 1) == total_epochs):
+                    torch.save(
+                        {
+                            "params": model.state_dict(),
+                            "epoch": epoch + 1,
+                            "best_psnr": best_psnr,
+                            "best_ssim": best_ssim,
+                            "val_psnr": float(val_psnr),
+                            "val_ssim": float(val_ssim),
+                            "train_psnr": float(train_psnr),
+                            "train_ssim": float(train_ssim),
+                            "elapsed": elapsed,
+                            "epoch_elapsed": epoch_elapsed,
+                        },
+                        models_dir / best_name,
+                    )
+
+        if is_main_process():
             torch.save(
                 {
                     "params": model.state_dict(),
                     "epoch": epoch + 1,
                     "best_psnr": best_psnr,
+                    "best_ssim": best_ssim,
                     "optimizer": optimizer.state_dict(),
                 },
                 models_dir / "latest.pt",
-            )
-            torch.save(
-                {
-                    "params": model.state_dict(),
-                    "epoch": epoch + 1,
-                    "best_psnr": best_psnr,
-                    "optimizer": optimizer.state_dict(),
-                },
-                models_dir / f"epoch_{epoch+1:04d}.pt",
             )
 
     dist.destroy_process_group()
