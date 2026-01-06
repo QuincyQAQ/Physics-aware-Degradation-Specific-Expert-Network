@@ -1,0 +1,16 @@
+#### network structures
+network:
+  name: DeMoE
+  img_channels: 3
+  width: 32
+  middle_blk_num: 2
+  enc_blk_nums: [2,2,2,2]
+  dec_blk_nums: [2,2,2,2]
+  num_experts: 5
+  k_used: 1
+
+Resize: False
+scale: 1.25
+
+images:
+  results_path: ./images/results

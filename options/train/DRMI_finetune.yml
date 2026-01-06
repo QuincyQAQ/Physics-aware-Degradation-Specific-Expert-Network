@@ -1,0 +1,39 @@
+#### network structures
+network:
+  name: DeMoE
+  img_channels: 3
+  width: 32
+  middle_blk_num: 2
+  enc_blk_nums: [2,2,2,2]
+  dec_blk_nums: [2,2,2,2]
+  num_experts: 5
+  k_used: 1
+
+seed: 42
+experiment_root: ./experiments
+experiment_name: DRMI_finetune
+
+datasets:
+  train:
+    meta_dir: ./data/DRMI_dataset/train/meta
+    gt_dir: ./data/DRMI_dataset/train/ground_truth
+  val:
+    meta_dir: ./data/DRMI_dataset/test/meta
+    gt_dir: ./data/DRMI_dataset/test/ground_truth
+
+train:
+  epochs: 10
+  batch_size: 2
+  patch_size: 256
+  num_workers: 4
+  augment: true
+
+  lr: 0.00005
+  min_lr: 0.000001
+  weight_decay: 0.0
+
+  amp: true
+  task: auto
+
+  save_every: 1
+  val_every: 1
