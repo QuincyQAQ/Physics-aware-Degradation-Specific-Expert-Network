@@ -1,0 +1,60 @@
+#### network structures
+network:
+  name: DeMoE
+  img_channels: 3
+  width: 32
+  middle_blk_num: 2
+  enc_blk_nums: [2,2,2,2]
+  dec_blk_nums: [2,2,2,2]
+  num_experts: 5
+  k_used: 1
+  find_unused_params: True
+
+seed: 42
+experiment_root: ./experiments
+experiment_name: DRMI_DMDiff_finetune
+
+# datasets:
+#   train:
+#     sources:
+#       - meta_dir: ../../data/DRMI_dataset/train/meta
+#         gt_dir: ../../data/DRMI_dataset/train/ground_truth
+#       - meta_dir: ../../data/DMDiff_ICCV2025/lr_train/lr
+#         gt_dir: ../../data/DMDiff_ICCV2025/gt_train/gt
+#   val:
+#     sources:
+#       - meta_dir: ../../data/DRMI_dataset/test/meta
+#         gt_dir: ../../data/DRMI_dataset/test/ground_truth
+#       - meta_dir: ../../data/DMDiff_ICCV2025/lr_test/lr
+#         gt_dir: ../../data/DMDiff_ICCV2025/gt_test/gt
+
+datasets:
+  train:
+    sources:
+      - meta_dir: ../../data/DRMI_dataset_90_10/train/meta
+        gt_dir: ../../data/DRMI_dataset_90_10/train/ground_truth
+      - meta_dir: ../../data/DMDiff_ICCV2025_90_10/train/lr
+        gt_dir: ../../data/DMDiff_ICCV2025_90_10/train/gt
+  val:
+    sources:
+      - meta_dir: ../../data/DRMI_dataset_90_10/val/meta
+        gt_dir: ../../data/DRMI_dataset_90_10/val/ground_truth
+      - meta_dir: ../../data/DMDiff_ICCV2025_90_10/val/lr
+        gt_dir: ../../data/DMDiff_ICCV2025_90_10/val/gt
+        
+train:
+  epochs: 10
+  batch_size: 30
+  patch_size: 256
+  num_workers: 4
+  augment: true
+
+  lr: 0.00005
+  min_lr: 0.000001
+  weight_decay: 0.0
+
+  amp: true
+  task: auto
+
+  save_every: 1
+  val_every: 1
